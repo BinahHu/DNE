@@ -1,6 +1,6 @@
 import torch
 
-from continual import convit, dytox, samplers, vit, convit_split, dytox_split, convit_split_v2
+from continual import convit, dytox, samplers, vit, convit_split, dne
 from continual.cnn import (InceptionV3, rebuffi, resnet18, resnet34, resnet50,
                            resnext50_32x4d, seresnet18, vgg16, vgg16_bn,
                            wide_resnet50_2, resnet18_scs, resnet18_scs_max, resnet18_scs_avg)
@@ -35,24 +35,8 @@ def get_backbone(args):
             ca_type='jointca' if args.joint_tokens else 'base',
             norm_layer=args.norm,
         )
-    elif args.model == 'convit_split':
+    elif args.model == 'dne':
         model = convit_split.ConVit_Split(
-            num_classes=args.nb_classes,
-            drop_rate=args.drop,
-            drop_path_rate=args.drop_path,
-            img_size=args.input_size,
-            patch_size=args.patch_size,
-            embed_dim=args.embed_dim,
-            depth=args.depth,
-            num_heads=args.num_heads,
-            local_up_to_layer=args.local_up_to_layer,
-            locality_strength=args.locality_strength,
-            class_attention=args.class_attention,
-            ca_type='jointca' if args.joint_tokens else 'base',
-            norm_layer=args.norm,
-        )
-    elif args.model == 'convit_split_v2':
-        model = convit_split_v2.ConVit_Split(
             num_classes=args.nb_classes,
             drop_rate=args.drop,
             drop_path_rate=args.drop_path,
@@ -148,7 +132,7 @@ def update_dytox(model_without_ddp, task_id, args):
     if task_id == 0:
         print(f'Creating DyTox!')
         if args.split:
-            model_without_ddp = dytox_split.DyTox_Split(
+            model_without_ddp = dne.DNE(
                 model_without_ddp,
                 nb_classes=args.initial_increment,
                 individual_classifier=args.ind_clf,

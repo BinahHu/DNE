@@ -61,13 +61,29 @@ class BatchEnsemble(nn.Module):
 
 
 class split_Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0., fc=split_blocks.split_Linear):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0., base_head_dim=32,
+                 fc=split_blocks.split_Linear, split_block_config={}, mlp_mode='All'):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
-        self.fc1 = fc(in_features, hidden_features)
+        head_num = in_features // base_head_dim
+        out_head_dim = out_features // head_num
+        hidden_head_dim = hidden_features // head_num
+
+        first_config = copy.deepcopy(split_block_config)
+        if mlp_mode == 'Second':
+            first_config['simple_proj'] = True
+            first_config['stack'] = False
+        self.fc1 = fc(in_features, hidden_features, head_dim=base_head_dim, out_head_dim=hidden_head_dim,
+                      **first_config)
         self.act = act_layer()
-        self.fc2 = fc(hidden_features, out_features)
+
+        second_config = copy.deepcopy(split_block_config)
+        if mlp_mode == 'First':
+            second_config['simple_proj'] = True
+            second_config['stack'] = False
+        self.fc2 = fc(hidden_features, out_features, head_dim=hidden_head_dim, out_head_dim=out_head_dim,
+                      **second_config)
         self.drop = nn.Dropout(drop)
         self.apply(self._init_weights)
 
@@ -75,11 +91,11 @@ class split_Mlp(nn.Module):
         self.fc1.freeze_split_old()
         self.fc2.freeze_split_old()
 
-    def expand(self, extra_in_features, extra_hidden_features=None, extra_out_features=None, split=True):
+    def expand(self, extra_in_features, extra_hidden_features=None, extra_out_features=None):
         extra_out_features = extra_out_features or extra_in_features
         extra_hidden_features = extra_hidden_features or extra_in_features
-        self.fc1.expand(extra_in_features, extra_hidden_features, split=split)
-        self.fc2.expand(extra_hidden_features, extra_out_features, split=split)
+        self.fc1.expand(extra_in_features, extra_hidden_features)
+        self.fc2.expand(extra_hidden_features, extra_out_features)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -95,30 +111,33 @@ class split_Mlp(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x):
+        # print("Now in MLP")
         x = self.fc1(x)
         x = self.act(x)
         x = self.drop(x)
-        x = self.fc2(x)
+        x = self.fc2(x, debug=True)
         x = self.drop(x)
         return x
 
 
 class split_GPSA(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.,
-                 locality_strength=1., use_local_init=True, fc=None):
+                 locality_strength=1., use_local_init=True, fc=None,
+                 split_block_config={}):
         super().__init__()
         self.num_heads = num_heads
         self.dim = dim
         head_dim = dim // num_heads
         self.scale = qk_scale or head_dim ** -0.5
+        self.split = split_block_config['split']
 
-        self.q = split_blocks.split_Linear(dim, dim, bias=qkv_bias)
-        self.k = split_blocks.split_Linear(dim, dim, bias=qkv_bias)
-        self.v = split_blocks.split_Linear(dim, dim, bias=qkv_bias)
+        self.q = split_blocks.split_Linear(dim, dim, bias=qkv_bias, **split_block_config)
+        self.k = split_blocks.split_Linear(dim, dim, bias=qkv_bias, **split_block_config)
+        self.v = split_blocks.split_Linear(dim, dim, bias=qkv_bias, **split_block_config)
 
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = split_blocks.split_Linear(dim, dim)
-        self.pos_proj = split_blocks.split_Linear(3, num_heads)
+        self.proj = split_blocks.split_Linear(dim, dim, **split_block_config)
+        self.pos_proj = split_blocks.split_Linear(3, num_heads, simple_proj=True)
         self.proj_drop = nn.Dropout(proj_drop)
         self.locality_strength = locality_strength
         self.gating_param_list = nn.ParameterList([nn.Parameter(torch.ones(self.num_heads))])
@@ -137,21 +156,21 @@ class split_GPSA(nn.Module):
         for p in self.gating_param_list[:-1]:
             p.requires_grad = False
 
-    def expand(self, extra_dim, extra_heads, split=True):
+    def expand(self, extra_dim, extra_heads):
         org_head_dim = self.dim // self.num_heads
         assert extra_heads * org_head_dim == extra_dim, "Extra head dim must be the same as original head dim!"
         self.num_heads += extra_heads
         self.dim += extra_dim
-        self.q.expand(extra_dim, extra_dim, split=split)
-        self.k.expand(extra_dim, extra_dim, split=split)
-        self.v.expand(extra_dim, extra_dim, split=split)
+        self.q.expand(extra_dim, extra_dim)
+        self.k.expand(extra_dim, extra_dim)
+        self.v.expand(extra_dim, extra_dim)
         self.v.local_init_latest_v(extra_dim)
 
-        self.proj.expand(extra_dim, extra_dim, split=split)
+        self.proj.expand(extra_dim, extra_dim)
         #Not sure how to init extra parts of self.proj, just random init, haha.
         #self.proj.local_init_latest_proj(extra_heads, locality_strength=self.locality_strength)
-        self.pos_proj.expand(0, extra_heads, split=split)
-        if not split:
+        self.pos_proj.expand(0, extra_heads)
+        if not self.split:
             assert len(self.gating_param_list) == 1, "If split is enabled, there can only be one block"
             new_gating_param = nn.Parameter(torch.ones(self.num_heads).to(self.q.device))
             new_gating_param.data[:-extra_heads] = self.gating_param_list[-1].data
@@ -184,7 +203,11 @@ class split_GPSA(nn.Module):
         if not hasattr(self, 'rel_indices') or self.rel_indices.size(1)!=N:
             self.get_rel_indices(N)
 
+        # print("Now in SAB")
+
         attn = self.get_attention(x)
+        # print("Disp attn in SAB")
+        # print(attn[0,0])
         v = self.v(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
@@ -328,15 +351,34 @@ class split_Block(nn.Module):
 
     def __init__(self, dim, num_heads,  mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=split_blocks.split_LayerNorm, attention_type=split_GPSA,
-                 fc=split_blocks.split_Linear, **kwargs):
+                 fc=split_blocks.split_Linear, split_block_config={}, dense_mode=['attn', 'mlp'], **kwargs):
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = attention_type(dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, fc=fc, **kwargs)
+        attn_split_block_config = copy.deepcopy(split_block_config)
+        if 'attn' not in dense_mode:
+            attn_split_block_config['simple_proj'] = True
+            attn_split_block_config['stack'] = False
+        self.attn = attention_type(dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop,
+                                   proj_drop=drop, fc=fc, split_block_config=attn_split_block_config, **kwargs)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp_ratio = mlp_ratio
-        self.mlp = split_Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop, fc=fc)
+        mlp_split_block_config = copy.deepcopy(split_block_config)
+        mlp_mode = 'None'
+        if 'mlp' in dense_mode:
+            mlp_mode = 'All'
+        elif 'mlp_first' in dense_mode:
+            mlp_mode = 'First'
+        elif 'mlp_second' in dense_mode:
+            mlp_mode = 'Second'
+        else:
+            mlp_mode = 'None'
+        if mlp_mode == 'None':
+            mlp_split_block_config['simple_proj'] = True
+            mlp_split_block_config['stack'] = False
+        self.mlp = split_Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop, fc=fc,
+                             split_block_config=mlp_split_block_config, mlp_mode=mlp_mode)
 
     def freeze_split_old(self):
         self.norm1.freeze_split_old()
@@ -344,12 +386,12 @@ class split_Block(nn.Module):
         self.attn.freeze_split_old()
         self.mlp.freeze_split_old()
 
-    def expand(self, extra_dim, extra_heads, split=True):
-        self.norm1.expand(extra_dim, split=split)
-        self.norm2.expand(extra_dim, split=split)
-        self.attn.expand(extra_dim, extra_heads, split=split)
+    def expand(self, extra_dim, extra_heads):
+        self.norm1.expand(extra_dim)
+        self.norm2.expand(extra_dim)
+        self.attn.expand(extra_dim, extra_heads)
         extra_mlp_hidden_dim = int(extra_dim * self.mlp_ratio)
-        self.mlp.expand(extra_dim, extra_hidden_features=extra_mlp_hidden_dim, split=split)
+        self.mlp.expand(extra_dim, extra_hidden_features=extra_mlp_hidden_dim)
 
     def reset_parameters(self):
         self.norm1.reset_parameters()
@@ -386,18 +428,19 @@ class split_Block(nn.Module):
 class split_ClassAttention(nn.Module):
     # taken from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
     # with slight modifications to do CA
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., fc=split_blocks.split_Linear):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.,
+                 fc=split_blocks.split_Linear, split_block_config={}):
         super().__init__()
         self.num_heads = num_heads
         self.dim = dim
         head_dim = dim // num_heads
         self.scale = qk_scale or head_dim ** -0.5
 
-        self.q = fc(dim, dim, bias=qkv_bias)
-        self.k = fc(dim, dim, bias=qkv_bias)
-        self.v = fc(dim, dim, bias=qkv_bias)
+        self.q = fc(dim, dim, bias=qkv_bias, **split_block_config)
+        self.k = fc(dim, dim, bias=qkv_bias, **split_block_config)
+        self.v = fc(dim, dim, bias=qkv_bias, **split_block_config)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = fc(dim, dim)
+        self.proj = fc(dim, dim, **split_block_config)
         self.proj_drop = nn.Dropout(proj_drop)
 
         self.apply(self._init_weights)
@@ -420,17 +463,18 @@ class split_ClassAttention(nn.Module):
         self.v.freeze_split_old()
         self.proj.freeze_split_old()
 
-    def expand(self, extra_dim, extra_heads, split=True):
+    def expand(self, extra_dim, extra_heads):
         org_head_dim = self.dim // self.num_heads
         assert extra_heads * org_head_dim == extra_dim, "Extra head dim must be the same as original head dim!"
         self.num_heads += extra_heads
         self.dim += extra_dim
-        self.q.expand(extra_dim, extra_dim, split=split)
-        self.k.expand(extra_dim, extra_dim, split=split)
-        self.v.expand(extra_dim, extra_dim, split=split)
-        self.proj.expand(extra_dim, extra_dim, split=split)
+        self.q.expand(extra_dim, extra_dim)
+        self.k.expand(extra_dim, extra_dim)
+        self.v.expand(extra_dim, extra_dim)
+        self.proj.expand(extra_dim, extra_dim)
 
     def forward(self, x, mask_heads=None, **kwargs):
+        # print("Now in TAB")
         B, N, C = x.shape
         q = self.q(x[:,0]).unsqueeze(1).reshape(B, 1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
         k = self.k(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
@@ -440,6 +484,8 @@ class split_ClassAttention(nn.Module):
 
         attn = (q @ k.transpose(-2, -1))
         attn = attn.softmax(dim=-1)
+        # print("Disp attn in TAB")
+        # print(attn[0, 0])
         attn = self.attn_drop(attn)
 
         if mask_heads is not None:
@@ -547,14 +593,14 @@ class split_PatchEmbed(nn.Module):
         self.patch_size = patch_size
         self.num_patches = num_patches
 
-        self.proj = split_blocks.split_Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.proj = split_blocks.split_Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, simple_proj=True)
         self.apply(self._init_weights)
 
     def freeze_split_old(self):
         self.proj.freeze_split_old()
 
-    def expand(self, extra_embd_size, split=True):
-        self.proj.expand(in_channels=0, out_channels=extra_embd_size, split=split)
+    def expand(self, extra_embd_size):
+        self.proj.expand(in_channels=0, out_channels=extra_embd_size)
 
     def reset_parameters(self):
         self.apply(self._init_weights)
@@ -619,7 +665,7 @@ class ConVit_Split(nn.Module):
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., hybrid_backbone=None, norm_layer='layer',
                  local_up_to_layer=3, locality_strength=1., use_pos_embed=True,
-                 class_attention=False, ca_type='base',
+                 class_attention=False, ca_type='base', split_block_config={}, dense_mode=['attn', 'mlp']
         ):
         super().__init__()
         self.num_classes_list = [num_classes]
@@ -634,14 +680,11 @@ class ConVit_Split(nn.Module):
             #norm_layer = nn.LayerNorm
         elif norm_layer == 'scale':
             raise NotImplementedError(f'Split scale normalization not implemented')
-            norm_layer = ScaleNorm
         else:
             raise NotImplementedError(f'Unknown normalization {norm_layer}')
 
         if hybrid_backbone is not None:
             raise NotImplementedError(f'Split HybrideEmbd not implemented')
-            self.patch_embed = HybridEmbed(
-                hybrid_backbone, img_size=img_size, in_chans=in_chans, embed_dim=embed_dim)
         else:
             self.patch_embed = split_PatchEmbed(
                 img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
@@ -672,21 +715,24 @@ class ConVit_Split(nn.Module):
                 block = split_Block(
                     dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
                     drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[layer_index], norm_layer=norm_layer,
-                    attention_type=split_GPSA, locality_strength=locality_strength
+                    attention_type=split_GPSA, locality_strength=locality_strength,
+                    split_block_config=split_block_config, dense_mode=dense_mode
                 )
             elif not class_attention:
                 # Convit
                 block = split_Block(
                     dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
                     drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[layer_index], norm_layer=norm_layer,
-                    attention_type=split_MHSA
+                    attention_type=split_MHSA,
+                    split_block_config=split_block_config, dense_mode=dense_mode
                 )
             else:
                 # CaiT
                 block = split_Block(
                     dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
                     drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[layer_index], norm_layer=norm_layer,
-                    attention_type=ca_block
+                    attention_type=ca_block,
+                    split_block_config=split_block_config, dense_mode=dense_mode
                 )
 
             blocks.append(block)

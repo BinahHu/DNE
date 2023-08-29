@@ -1,19 +1,12 @@
-#######################
-# DyTox, for CIFAR100 #
-#######################
-
 # Model definition
 model: convit_split_v2
 embed_dim: 384
 depth: 6
 num_heads: 12
-patch_size: 32
+patch_size: 16
 input_size: 224
 local_up_to_layer: 5
 class_attention: true
-
-#batch_size: 64
-#incremental_batch_size: 64
 
 # Training setting
 no_amp: false

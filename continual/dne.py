@@ -3,12 +3,12 @@ import copy
 import torch
 from timm.models.layers import trunc_normal_
 from torch import nn
-import torch.nn.functional as F
 
 import continual.utils as cutils
+import continual.split_blocks as split_blocks
 
 
-class ContinualClassifier(nn.Module):
+class split_ContinualClassifier(nn.Module):
     """Your good old classifier to do continual."""
     def __init__(self, embed_dim, nb_classes):
         super().__init__()
@@ -34,17 +34,26 @@ class ContinualClassifier(nn.Module):
         self.head = head
         self.nb_classes += n
 
+    def expand(self, extra_dim, extra_out):
+        head = nn.Linear(self.embed_dim + extra_dim, self.nb_classes + extra_out, bias=True)
+        if extra_out > 0:
+            head.weight.data[:-extra_out, :-extra_dim] = self.head.weight.data
+        else:
+            head.weight.data[:, :-extra_dim] = self.head.weight.data
 
-class DyTox(nn.Module):
-    """"DyTox for the win!
+        norm = nn.LayerNorm(self.embed_dim + extra_dim)
+        norm.weight.data[:-extra_dim] = self.norm.weight.data
+        norm.bias.data[:-extra_dim] = self.norm.bias.data
 
-    :param transformer: The base transformer.
-    :param nb_classes: Thhe initial number of classes.
-    :param individual_classifier: Classifier config, DyTox is in `1-1`.
-    :param head_div: Whether to use the divergence head for improved diversity.
-    :param head_div_mode: Use the divergence head in TRaining, FineTuning, or both.
-    :param joint_tokens: Use a single TAB forward with masked attention (faster but a bit worse).
-    """
+        head.to(self.head.weight.device)
+        norm.to(self.head.weight.device)
+        self.head = head
+        self.norm = norm
+        self.nb_classes += extra_out
+        self.embed_dim += extra_dim
+
+
+class DNE(nn.Module):
     def __init__(
         self,
         transformer,
@@ -53,12 +62,13 @@ class DyTox(nn.Module):
         head_div=False,
         head_div_mode=['tr', 'ft'],
         joint_tokens=False,
-        dynamic_tokens=False
+        single_token=False,
+        split_block_config={}
     ):
         super().__init__()
 
         self.nb_classes = nb_classes
-        self.embed_dim = transformer.embed_dim
+        self.embed_dim_list = transformer.embed_dim_list
         self.individual_classifier = individual_classifier
         self.use_head_div = head_div
         self.head_div_mode = head_div_mode
@@ -69,77 +79,34 @@ class DyTox(nn.Module):
         self.nb_classes_per_task = [nb_classes]
 
         self.patch_embed = transformer.patch_embed
-        self.pos_embed = transformer.pos_embed
+        self.num_patches = transformer.num_patches
+        self.pos_embed_list = transformer.pos_embed_list
         self.pos_drop = transformer.pos_drop
         self.sabs = transformer.blocks[:transformer.local_up_to_layer]
 
         self.tabs = transformer.blocks[transformer.local_up_to_layer:]
+        self.split = split_block_config['split']
 
-        self.dynamic_tokens = dynamic_tokens
-
-        if self.dynamic_tokens:
-            self._init_weights = transformer._init_weights
-            self.num_patches = transformer.num_patches
-            self.class_means = torch.zeros(nb_classes, self.num_patches, self.embed_dim).cuda()
-            self.task_tokens = nn.ModuleList([nn.ModuleList([nn.Linear(self.num_patches * self.embed_dim, self.embed_dim).cuda(),
-                                              nn.Linear(nb_classes * self.embed_dim, self.embed_dim).cuda()])])
-            self._init_weights(self.task_tokens[0][0])
-            self._init_weights(self.task_tokens[0][1])
-        else:
-            self.task_tokens = nn.ParameterList([transformer.cls_token])
+        self.single_token = single_token
+        self.task_tokens = nn.ParameterList([nn.Parameter(torch.zeros(1, 1, self.embed_dim).cuda())])
 
         if self.individual_classifier != '':
             in_dim, out_dim = self._get_ind_clf_dim()
             self.head = nn.ModuleList([
-                ContinualClassifier(in_dim, out_dim).cuda()
+                split_ContinualClassifier(in_dim, out_dim).cuda()
             ])
         else:
-            self.head = ContinualClassifier(
+            self.head = split_ContinualClassifier(
                 self.embed_dim * len(self.task_tokens), sum(self.nb_classes_per_task)
             ).cuda()
 
-    def update_class_means(self, class_means):
-        """Update the feature mean of each class"""
-        self.class_means = copy.deepcopy(class_means).cuda()
+    @property
+    def embed_dim(self):
+        return sum(self.embed_dim_list)
 
-    def get_dynamic_task_tokens(self):
-        """Get task token with class means"""
-
-        task_tokens = []
-        mean_flag = True
-        if mean_flag:
-            for t in range(len(self.task_tokens)):
-                p1 = sum(self.nb_classes_per_task[:t])
-                p2 = sum(self.nb_classes_per_task[:t + 1])
-                task_tokens.append(self.class_means[p1:p2].mean(dim=(0,1), keepdim=True))
-            return task_tokens
-
-        if self.in_finetuning:
-            for t, token_projs in enumerate(self.task_tokens):
-                p1 = sum(self.nb_classes_per_task[:t])
-                p2 = sum(self.nb_classes_per_task[:t + 1])
-                proj1, proj2 = token_projs
-
-                class_embd = proj1(self.class_means[p1:p2].view(p2 - p1, -1))
-                task_embd = proj2(F.gelu(class_embd.unsqueeze(0).view(1, -1)))
-                task_tokens.append(F.gelu(task_embd.unsqueeze(0)))
-        else:
-            with torch.no_grad():
-                for t, token_projs in enumerate(self.task_tokens[:-1]):
-                    p1 = sum(self.nb_classes_per_task[:t])
-                    p2 = sum(self.nb_classes_per_task[:t+1])
-                    proj1, proj2 = token_projs
-
-                    class_embd = proj1(self.class_means[p1:p2].view(p2-p1, -1))
-                    task_embd = proj2(F.gelu(class_embd.unsqueeze(0).view(1,-1)))
-                    task_tokens.append(F.gelu(task_embd.unsqueeze(0)))
-            nb = self.nb_classes_per_task[-1]
-            proj1, proj2 = self.task_tokens[-1]
-            class_embd = proj1(self.class_means[-nb:].view(nb, -1))
-            task_embd = proj2(F.gelu(class_embd.unsqueeze(0).view(1,-1)))
-            task_tokens.append(F.gelu(task_embd.unsqueeze(0)))
-        return task_tokens
-
+    @property
+    def pos_embed(self):
+        return torch.cat(list(self.pos_embed_list), dim=-1)
 
     def end_finetuning(self):
         """Start FT mode, usually with backbone freezed and balanced classes."""
@@ -148,6 +115,80 @@ class DyTox(nn.Module):
     def begin_finetuning(self):
         """End FT mode, usually with backbone freezed and balanced classes."""
         self.in_finetuning = True
+
+    def freeze_split_old(self):
+        self.patch_embed.freeze_split_old()
+        for p in self.pos_embed_list[:-1]:
+            p.requires_grad = False
+        for b in self.sabs:
+            b.freeze_split_old()
+
+        for b in self.tabs:
+            b.freeze_split_old()
+
+    def fix_and_update_attn(self):
+        self.apply(self.module_fix_and_update_attn)
+
+    def module_fix_and_update_attn(self, m):
+        if isinstance(m, split_blocks.split_Linear):
+            m.fix_and_update_attn()
+
+    def expand(self, extra_dim, extra_heads, increment):
+        self.nb_classes_per_task.append(increment)
+        self.embed_dim_list.append(extra_dim)
+
+        self.patch_embed.expand(extra_dim)
+
+        if not self.split:
+            new_pos_embd = nn.Parameter(torch.zeros(1, self.num_patches, self.embed_dim).cuda())
+            new_pos_embd.data[..., :-extra_dim] = self.pos_embed_list[-1].data
+            self.pos_embed_list[-1] = new_pos_embd
+        else:
+            for p in self.pos_embed_list.parameters():
+                p.requires_grad = False
+            self.pos_embed_list.append(nn.Parameter(torch.zeros(1, self.num_patches, extra_dim).cuda()))
+            trunc_normal_(self.pos_embed_list[-1], std=.02)
+
+        for b in self.sabs:
+            b.expand(extra_dim, extra_heads)
+
+        for b in self.tabs:
+            b.expand(extra_dim, extra_heads)
+
+        if self.single_token:
+            new_task_token = nn.Parameter(torch.zeros(1, 1, extra_dim).cuda())
+            trunc_normal_(new_task_token, std=.02)
+            self.task_tokens.append(new_task_token)
+        else:
+            new_task_tokens = nn.ParameterList([])
+            for i in range(len(self.nb_classes_per_task)):
+                new_task_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim).cuda())
+                ref_id = i if i < len(self.nb_classes_per_task) - 1 else -1
+                new_task_token.data[:,:,:-self.embed_dim_list[-1]] = self.task_tokens[ref_id].data
+                new_task_tokens.append(new_task_token)
+            del self.task_tokens
+            self.task_tokens = new_task_tokens
+
+        if self.use_head_div:
+            self.head_div = split_ContinualClassifier(
+                self.embed_dim, self.nb_classes_per_task[-1] + 1
+            ).cuda()
+
+        if self.individual_classifier != '':
+            in_dim, out_dim = self._get_ind_clf_dim()
+            for head in self.head:
+                head.expand(extra_dim, 0)
+            self.head.append(
+                split_ContinualClassifier(in_dim, out_dim).cuda()
+            )
+        else:
+            if self.single_token:
+                in_dim = self.embed_dim
+            else:
+                in_dim = self.embed_dim * len(self.task_tokens)
+            self.head = split_ContinualClassifier(
+                in_dim, sum(self.nb_classes_per_task)
+            ).cuda()
 
     def add_model(self, nb_new_classes):
         """Expand model as per the DyTox framework given `nb_new_classes`.
@@ -158,17 +199,13 @@ class DyTox(nn.Module):
 
         # Class tokens ---------------------------------------------------------
         new_task_token = copy.deepcopy(self.task_tokens[-1])
-        if self.dynamic_tokens:
-            self._init_weights(new_task_token[0])
-            self._init_weights(new_task_token[1])
-        else:
-            trunc_normal_(new_task_token, std=.02)
+        trunc_normal_(new_task_token, std=.02)
         self.task_tokens.append(new_task_token)
         # ----------------------------------------------------------------------
 
         # Diversity head -------------------------------------------------------
         if self.use_head_div:
-            self.head_div = ContinualClassifier(
+            self.head_div = split_ContinualClassifier(
                 self.embed_dim, self.nb_classes_per_task[-1] + 1
             ).cuda()
         # ----------------------------------------------------------------------
@@ -177,21 +214,13 @@ class DyTox(nn.Module):
         if self.individual_classifier != '':
             in_dim, out_dim = self._get_ind_clf_dim()
             self.head.append(
-                ContinualClassifier(in_dim, out_dim).cuda()
+                split_ContinualClassifier(in_dim, out_dim).cuda()
             )
         else:
-            self.head = ContinualClassifier(
+            self.head = split_ContinualClassifier(
                 self.embed_dim * len(self.task_tokens), sum(self.nb_classes_per_task)
             ).cuda()
         # ----------------------------------------------------------------------
-
-        # Class means -----------------------------------------------------------
-        if self.dynamic_tokens:
-            new_class_means = torch.zeros(sum(self.nb_classes_per_task), self.num_patches, self.embed_dim).cuda()
-            new_class_means[:sum(self.nb_classes_per_task[:-1]), :, :] = copy.deepcopy(self.class_means)
-            self.class_means = new_class_means
-        # ----------------------------------------------------------------------
-
 
     def _get_ind_clf_dim(self):
         """What are the input and output dim of classifier depending on its config.
@@ -205,10 +234,16 @@ class DyTox(nn.Module):
             in_dim = self.embed_dim
             out_dim = sum(self.nb_classes_per_task)
         elif self.individual_classifier == 'n-n':
-            in_dim = len(self.task_tokens) * self.embed_dim
+            if self.single_token:
+                in_dim = self.embed_dim
+            else:
+                in_dim = len(self.task_tokens) * self.embed_dim
             out_dim = sum(self.nb_classes_per_task)
         elif self.individual_classifier == 'n-1':
-            in_dim = len(self.task_tokens) * self.embed_dim
+            if self.single_token:
+                in_dim = self.embed_dim
+            else:
+                in_dim = len(self.task_tokens) * self.embed_dim
             out_dim = self.nb_classes_per_task[-1]
         else:
             raise NotImplementedError(f'Unknown ind classifier {self.individual_classifier}')
@@ -219,6 +254,7 @@ class DyTox(nn.Module):
         requires_grad = False
         cutils.freeze_parameters(self, requires_grad=not requires_grad)
         self.train()
+        self.freeze_split_old()
 
         for name in names:
             if name == 'all':
@@ -231,7 +267,7 @@ class DyTox(nn.Module):
             elif name == 'sab':
                 self.sabs.eval()
                 cutils.freeze_parameters(self.patch_embed, requires_grad=requires_grad)
-                cutils.freeze_parameters(self.pos_embed, requires_grad=requires_grad)
+                cutils.freeze_parameters(self.pos_embed_list, requires_grad=requires_grad)
                 cutils.freeze_parameters(self.sabs, requires_grad=requires_grad)
             elif name == 'tab':
                 self.tabs.eval()
@@ -256,7 +292,7 @@ class DyTox(nn.Module):
             'new_task_tokens': [self.task_tokens[-1]],
             'sa': self.sabs.parameters(),
             'patch': self.patch_embed.parameters(),
-            'pos': [self.pos_embed],
+            'pos': self.pos_embed_list.parameters(),
             'ca': self.tabs.parameters(),
             'old_heads': self.head[:-self.nb_classes_per_task[-1]].parameters() \
                               if self.individual_classifier else \
@@ -289,10 +325,12 @@ class DyTox(nn.Module):
         # Compute mean distance between class tokens
         mean_dist, min_dist, max_dist = [], float('inf'), 0.
         with torch.no_grad():
-            task_tokens = self.get_dynamic_task_tokens() if self.dynamic_tokens else self.task_tokens
             for i in range(len(self.task_tokens)):
                 for j in range(i + 1, len(self.task_tokens)):
-                    dist = torch.norm(task_tokens[i] - task_tokens[j], p=2).item()
+                    if self.single_token:
+                        dist = 0
+                    else:
+                        dist = torch.norm(self.task_tokens[i] - self.task_tokens[j], p=2).item()
                     mean_dist.append(dist)
 
                     min_dist = min(dist, min_dist)
@@ -319,6 +357,62 @@ class DyTox(nn.Module):
         int_losses = {}
         return int_losses
 
+    @torch.no_grad()
+    def check(self):
+        x = torch.ones(2, 3, 32, 32).cuda()
+        B = x.shape[0]
+
+        x = self.patch_embed(x)
+        print("Patch embd")
+        print(x[0, 0, :10])
+        x = x + self.pos_embed
+        print("Pos embd")
+        print(x[0, 0, :10])
+        x = self.pos_drop(x)
+
+        s_e, s_a, s_v = [], [], []
+        for blk in self.sabs:
+            x, attn, v = blk(x)
+            s_e.append(x)
+            s_a.append(attn)
+            s_v.append(v)
+        print("SAB")
+        print(x[0, 0, :10])
+
+        # Specific part, this is what we called the "task specific DECODER"
+        if self.joint_tokens:
+            return self.forward_features_jointtokens(x)
+
+        tokens = []
+        attentions = []
+        mask_heads = None
+
+        if self.single_token:
+            task_token = torch.cat(list(self.task_tokens), dim=-1)
+            task_token = task_token.expand(B, -1, -1)
+            print("Task token")
+            print(task_token[0, 0, :10])
+
+            for blk in self.tabs:
+                task_token, attn, v = blk(torch.cat((task_token, x), dim=1), mask_heads=mask_heads)
+            attentions = [attn]
+            tokens = [task_token[:, 0]]
+            print("Display final token")
+            print(tokens[0][0, :10])
+            c = input()
+        else:
+            for task_token in self.task_tokens:
+                task_token = task_token.expand(B, -1, -1)
+
+                for blk in self.tabs:
+                    task_token, attn, v = blk(torch.cat((task_token, x), dim=1), mask_heads=mask_heads)
+
+                attentions.append(attn)
+                tokens.append(task_token[:, 0])
+
+        self._class_tokens = tokens
+
+
     def forward_features(self, x):
         # Shared part, this is the ENCODER
         B = x.shape[0]
@@ -342,19 +436,27 @@ class DyTox(nn.Module):
         attentions = []
         mask_heads = None
 
-        task_tokens = self.get_dynamic_task_tokens() if self.dynamic_tokens else self.task_tokens
 
-        for task_token in task_tokens:
+        if self.single_token:
+            task_token = torch.cat(list(self.task_tokens), dim=-1)
             task_token = task_token.expand(B, -1, -1)
 
             for blk in self.tabs:
                 task_token, attn, v = blk(torch.cat((task_token, x), dim=1), mask_heads=mask_heads)
+            attentions = [attn]
+            tokens = [task_token[:, 0]]
+        else:
+            for task_token in self.task_tokens:
+                task_token = task_token.expand(B, -1, -1)
 
-            attentions.append(attn)
-            tokens.append(task_token[:, 0])
+                for blk in self.tabs:
+                    task_token, attn, v = blk(torch.cat((task_token, x), dim=1), mask_heads=mask_heads)
+
+                attentions.append(attn)
+                tokens.append(task_token[:, 0])
 
         self._class_tokens = tokens
-        return tokens, tokens[-1], attentions, x
+        return tokens, tokens[-1], attentions
 
     def forward_features_jointtokens(self, x):
         """Method to do a single TAB forward with all task tokens.
@@ -363,6 +465,7 @@ class DyTox(nn.Module):
         give the same results as multiple TAB forward, but in practice it's a little
         bit worse, not sure why. So if you have an idea, please tell me!
         """
+        raise NotImplementedError("This function not implemented yet")
         B = len(x)
 
         task_tokens = torch.cat(
@@ -402,12 +505,14 @@ class DyTox(nn.Module):
             logits = []
 
             for i, head in enumerate(self.head):
-                if self.individual_classifier in ('1-n', '1-1'):
+                if self.single_token:
+                    logits.append(head(last_token))
+                elif self.individual_classifier in ('1-n', '1-1'):
                     logits.append(head(tokens[i]))
                 else:  # n-1, n-n
                     logits.append(head(torch.cat(tokens[:i+1], dim=1)))
 
-            if self.individual_classifier in ('1-1', 'n-1'):
+            if self.individual_classifier in ('1-1', 'n-1') or self.single_token:
                 logits = torch.cat(logits, dim=1)
             else:  # 1-n, n-n
                 final_logits = torch.zeros_like(logits[-1])
@@ -433,10 +538,8 @@ class DyTox(nn.Module):
         }
 
     def forward(self, x):
-        tokens, last_token, _, f = self.forward_features(x)
-        res_dict = self.forward_classifier(tokens, last_token)
-        res_dict['sab_feature'] = f
-        return res_dict
+        tokens, last_token, _ = self.forward_features(x)
+        return self.forward_classifier(tokens, last_token)
 
 
 def eval_training_finetuning(mode, in_ft):

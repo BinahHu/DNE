@@ -1,9 +1,5 @@
-#######################
-# DyTox, for CIFAR100 #
-#######################
-
 # Model definition
-model: convit_split
+model: dne
 embed_dim: 384
 depth: 6
 num_heads: 12
@@ -18,8 +14,8 @@ eval_every: 50
 
 # Base hyperparameter
 weight_decay: 0.000001
-batch_size: 128
-incremental_batch_size: 128
+batch_size: 64
+incremental_batch_size: 64
 incremental_lr: 0.0005
 rehearsal: icarl_all
 
@@ -38,8 +34,14 @@ split: True
 split_tab: True
 single_token: True
 
-default_split: True
-default_stack: True
+dense_mode: [mlp]
+split_block_config:
+  proj_type: Linear
+  fix_attn: False
+  split: True
+  stack: True
+  simple_proj: False
+  attn_qk_linear: False
 
 # Divergence head to get diversity
 head_div: 0.1
