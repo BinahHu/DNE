@@ -12,5 +12,5 @@ CUDA_VISIBLE_DEVICES=${GPUS} python -m torch.distributed.launch --master_port ${
 --options options/data/cifar100_50-10.yaml options/data/cifar100_order1.yaml options/model/cifar_dne.yaml \
     --name dne_mlp_dense_only_cifar100_b50_10 \
     --data-path /mnt/datasets/CIFAR100/ \
-    --output-basedir /mnt/log/ckpt/DNE \
-    --output-basedir ckpt/ --extra-dim 32 --extra-heads 1
+    --log-path /mnt/log/log/DNE \
+    --output-basedir /mnt/log/ckpt/DNE --extra-dim 224 --extra-heads 1
