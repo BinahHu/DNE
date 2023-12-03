@@ -31,7 +31,6 @@ from continual.sam import SAM
 from continual.datasets import build_dataset
 from continual.engine import eval_and_log, train_one_epoch
 from continual.losses import bce_with_logits, soft_bce_with_logits
-from continual.split_blocks import split_config
 
 warnings.filterwarnings("ignore")
 
@@ -347,9 +346,6 @@ def main(args):
     mixup_fn = None
     mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
 
-    #Set up split block
-    split_config.set_split(args.default_split)
-    split_config.set_stack(args.default_stack)
 
     model = factory.get_backbone(args)
     model.head = Classifier(
